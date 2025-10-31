@@ -154,32 +154,57 @@ def read_prune_ratios_from_yaml(file_name, model):
             raise exc
 
 
-def unstructured_prune(tensor: torch.Tensor, sparsity : float) -> torch.Tensor:
+def unstructured_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
+    """Create an unstructured magnitude-based pruning mask for a weight tensor.
+
+    This does NOT change the original tensor - it only returns a mask of the
+    same shape where 1 means keep and 0 means prune. The caller can then apply:
+    `pruned_weight = tensor * mask`.
+
+    Args:
+        tensor (torch.Tensor): Weight tensor from a conv/linear layer.
+        sparsity (float): Target fraction in [0.0, 1.0] of weights to prune
+            (e.g. 0.3 means prune 30 percent smallest-magnitude weights).
+
+    Returns:
+        torch.Tensor: Mask tensor with same shape as `tensor`, dtype same as
+        `tensor` (0.0 for pruned elements, 1.0 for kept elements).
+
+    Raises:
+        ValueError: If `sparsity` is negative.
     """
-    Implement magnitude-based unstructured pruning for weight tensor (of a layer)
-    :param tensor: torch.(cuda.)Tensor, weight of conv/fc layer
-    :param sparsity: float, pruning sparsity
-  
-    :return:
-        torch.(cuda.)Tensor, pruning mask (1 for nonzeros, 0 for zeros)
-    """
 
-    ##################### YOUR CODE STARTS HERE #####################
-    # Step 1: Calculate how many weights should be pruned
+    # 1) Validate sparsity
+    if sparsity < 0.0:
+        raise ValueError("sparsity must be >= 0.0")
 
-    # Step 2: Find the threshold of weight magnitude (th) based on sparsity.
+    # 2) Edge case: no pruning
+    if sparsity == 0.0:
+        return torch.ones_like(tensor, dtype=tensor.dtype)
 
-    # Step 3: Get the pruning mask tensor based on the th. The mask tensor should have same shape as the weight tensor
-    #         |weight| <= th -> mask=0,
-    #         |weight| >  th -> mask=1
+    # 3) Edge case: full pruning (sparsity >= 1.0)
+    if sparsity >= 1.0:
+        return torch.zeros_like(tensor, dtype=tensor.dtype)
 
-    # Step 4: Apply mask tensor to the weight tensor
-    #         weight_pruned = weight * mask
+    # 4) Flatten magnitudes to pick global threshold; detach to avoid autograd tracking
+    flat_abs = tensor.detach().abs().view(-1)
+    numel = flat_abs.numel()
 
-    ##################### YOUR CODE ENDS HERE #######################
+    # 5) How many to prune = smallest k magnitudes; If k becomes 0 due to rounding, just keep all
+    k = int(numel * sparsity)
+    if k == 0:
+        return torch.ones_like(tensor, dtype=tensor.dtype)
 
-    # return the mask to record the pruning location ()
-    return
+    # 6) Find magnitude threshold = kth smallest magnitude; torch.kthvalue is 1-based, so we use k (already >=1 here)
+    th, _ = torch.kthvalue(flat_abs, k)
+
+    # 7) Build mask
+    # Prune (set to 0) everything whose magnitude is <= threshold
+    # Keep (set to 1) everything whose magnitude is > threshold
+    # We use <= to hit the target sparsity more reliably
+    mask = (tensor.abs() > th).to(dtype=tensor.dtype)
+
+    # 8) Return mask for caller to apply: weight_pruned = tensor * mask
     return mask
 
 
@@ -188,7 +213,7 @@ def filter_prune(tensor: torch.Tensor, sparsity : float) -> torch.Tensor:
     implement L2-norm-based filter pruning for weight tensor (of a layer)
     :param tensor: torch.(cuda.)Tensor, weight of conv/fc layer
     :param sparsity: float, pruning sparsity
-  
+
     :return:
         torch.(cuda.)Tensor, pruning mask (1 for nonzeros, 0 for zeros)
     """
@@ -323,6 +348,23 @@ def prune_channels_after_filter_prune():
     # 4. Can we apply this function to ResNet and get the same conclusion? Why?
     pass
 
+def _debug_test_unstructured(model):
+    # pick first conv
+    layer = dict(model.named_parameters())["features.0.weight"]
+    sparsity = 0.80
+    mask = unstructured_prune(layer.data, sparsity)
+
+    # apply (just locally)
+    pruned = layer.data * mask
+
+    numel = layer.numel()
+    zeros = (mask == 0).sum().item()
+    print(f"[DEBUG] features.0.weight -> target={sparsity:.2f}, zeros={zeros}/{numel} = {zeros/numel:.4f}")
+    # sanity: original tensor should not have changed in model params here
+    # we didn't assign back; if you want to see it, assign:
+    # layer.data = pruned
+
+
 def main():
 
     use_cuda = torch.cuda.is_available()
@@ -356,8 +398,13 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader), eta_min=4e-08)
 
     # ========= your code starts here ========
-    dict_ratio = read_prune_ratios_from_yaml("vgg13_example.yaml", model)
-    print(dict_ratio)
+
+    # 1) check YAML
+    prune_dict = read_prune_ratios_from_yaml(args.yaml_path, model)
+    print("[INFO] YAML OK:", prune_dict)
+
+    # 2) quick pruning smoke test
+    _debug_test_unstructured(model)
     """
         main()
             |- read_prune_ratios_from_yaml()
