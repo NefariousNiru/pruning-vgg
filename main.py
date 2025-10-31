@@ -208,76 +208,183 @@ def unstructured_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
     return mask
 
 
-def filter_prune(tensor: torch.Tensor, sparsity : float) -> torch.Tensor:
+def filter_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
+    """Create an L2-norm based filter-pruning mask for a layer weight tensor.
+
+    For conv weights shaped [out_channels, in_channels, kH, kW], we:
+    - compute L2 norm per output filter
+    - prune the smallest `sparsity * out_channels` filters
+    - return a mask broadcast to the full weight shape
+
+    For linear weights shaped [out_features, in_features], we do the same but
+    treat each out_feature as a "filter".
+
+    Args:
+        tensor (torch.Tensor): Layer weights. Expected 4D conv weights or 2D linear weights.
+        sparsity (float): Target fraction in [0.0, 1.0] of filters to prune.
+
+    Returns:
+        torch.Tensor: Mask with same shape as `tensor`, 1.0 where kept, 0.0 where pruned.
+
+    Raises:
+        ValueError: If `sparsity` is negative.
     """
-    implement L2-norm-based filter pruning for weight tensor (of a layer)
-    :param tensor: torch.(cuda.)Tensor, weight of conv/fc layer
-    :param sparsity: float, pruning sparsity
 
-    :return:
-        torch.(cuda.)Tensor, pruning mask (1 for nonzeros, 0 for zeros)
-    """
+    # 1) Basic validation
+    if sparsity < 0.0:
+        raise ValueError("sparsity must be >= 0.0")
 
-    ##################### YOUR CODE STARTS HERE #####################
-    # Step 1: Calculate how many filters should be pruned
+    # 2) Edge cases
+    if sparsity == 0.0:
+        return torch.ones_like(tensor, dtype=tensor.dtype)
+    if sparsity >= 1.0:
+        return torch.zeros_like(tensor, dtype=tensor.dtype)
 
-    # Step 2: Find the threshold of filter's L2-norm (th) based on sparsity.
+    # 3) Get number of filters/output channels
+    # conv: [OC, IC, kH, kW]
+    # linear: [OC, IC]
+    out_channels = tensor.size(0)
+    num_prune = int(out_channels * sparsity)
 
-    # Step 3: Get the pruning mask tensor based on the th. The mask tensor should have same shape as the weight tensor
-    #         ||filter||2 <= th -> mask=0,
-    #         ||filter||2 >  th -> mask=1
+    # 4) If rounding made it 0, just keep all; If we ended up pruning everything, return zeros
+    if num_prune == 0:
+        return torch.ones_like(tensor, dtype=tensor.dtype)
+    if num_prune >= out_channels:
+        return torch.zeros_like(tensor, dtype=tensor.dtype)
 
-    # Step 4: Apply mask tensor to the weight tensor
-    #         weight_pruned = weight * mask
+    # 5) Compute L2 norm per filter
+    if tensor.dim() == 4:
+        # 5.1) conv case; norm_i = ||W_i||_2 for each output filter
+        filt_norms = tensor.detach().pow(2).sum(dim=(1, 2, 3)).sqrt()  # [OC]
+    elif tensor.dim() == 2:
+        # 5.2) linear case
+        filt_norms = tensor.detach().pow(2).sum(dim=1).sqrt()  # [OC]
+    else:
+        # 5.3) unsupported shape
+        raise ValueError(f"filter_prune expects 2D or 4D tensor, got {tensor.dim()}D")
 
-    ##################### YOUR CODE ENDS HERE #######################
+    # 6) Threshold = kth smallest norm
+    th, _ = torch.kthvalue(filt_norms, num_prune)
 
-    # return the mask to record the pruning location ()
-    return
+    # 7) Build keep vector; prune norms <= threshold
+    keep_vec = (filt_norms > th).to(dtype=tensor.dtype)  # [OC]
+
+    # 8) Broadcast to full weight shape
+    if tensor.dim() == 4:
+        mask = keep_vec.view(out_channels, 1, 1, 1).expand_as(tensor)
+    else:  # 2D
+        mask = keep_vec.view(out_channels, 1).expand_as(tensor)
+
+    # 9) Caller can do: pruned = tensor * mask
     return mask
 
 
-def apply_pruning():
-    # calculate layer_wise prune ratio for current round (if IMP)
-    
-    # call unstructured_prune()  
-    # or 
-    # call filter_prune (...)
-    pass
+
+def apply_pruning(model: nn.Module, prune_ratio_dict: dict, sparsity_type: str) -> dict[str, torch.Tensor]:
+    """Apply in-place pruning to selected conv layers of a model.
+
+    Notes:
+    - looks up each parameter name in `prune_ratio_dict`
+    - skips anything not listed
+    - skips non-4D params (so we ignore bias, BN, embedding, etc.)
+    - builds a mask using either unstructured or filter pruning
+    - multiplies the weight by the mask in-place
+
+    Args:
+        model (nn.Module): Model whose parameters will be pruned in-place.
+        prune_ratio_dict (dict): Mapping from parameter name to pruning ratio
+            (float in [0.0, 1.0]). Names must match `model.named_parameters()`.
+        sparsity_type (str): Either "unstructured" or "filter".
+
+    Returns:
+        dict[str, torch.Tensor]: Mapping from parameter name to pruned weights.
+
+    Raises:
+        ValueError: If `sparsity_type` is not recognized.
+    """
+
+    masks: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        # 1) Walk every parameter in the model
+        for name, p in model.named_parameters():
+            if name not in prune_ratio_dict:
+                continue
+
+            # 1.2) Only prune conv-like weights (4D). Intentionally skip BN, bias, etc.
+            if p.dim() != 4:
+                continue
+
+            ratio = float(prune_ratio_dict[name])
+
+            # 3) Build pruning mask according to selected sparsity type
+            if sparsity_type == "unstructured":
+                mask = unstructured_prune(p.data, ratio)
+            elif sparsity_type == "filter":
+                mask = filter_prune(p.data, ratio)
+            else:
+                raise ValueError(f"unknown sparsity_type={sparsity_type}")
+
+            # 4) In-place apply mask: weight_pruned = weight * mask
+            p.data *= mask
+            masks[name] = mask
+    return masks
 
 
-def test_sparsity(model, sparisty_type):
-    # This function is used to check the model sparsity.
-    # It should be able to print the sparisty ratio of each layer.
+def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -> None:
+    """Print per-layer and overall sparsity statistics for a model.
 
-    # This example is obtained by testing a dense vgg13 model, 
-    # this is why the sparity and number of zeros are all 0.
-    # When you successfully pruned the model, then it should show the target sparisty ratio.
-    # In other words, if the sparity of your pruned model is 0%, this indicates there must be something wrong.
+    Supports:
+    - unstructured: count zero elements per parameter tensor
+    - filter: count zeroed-out conv filters (OC-level) only
 
-    # features.x.weight is the layer name. 
-    # You can the layer name and its weights by using the following for loop.
-    # for name, weight in model.named_parameters():
+    Args:
+        model (torch.nn.Module): Model to inspect.
+        sparsity_type (str): Either "unstructured" or "filter".
 
-    # For sparisty_type="unstructured":
+    Raises:
+        ValueError: If `sparsity_type` is not supported.
+    """
 
-    # Sparsity type is: xxxx (e.g., unstructured pruned or filter pruned)
-    # (zero/total) weights of features.0.weight is: (0/1728). Sparsity is: 0.00%
-    # (zero/total) weights of features.3.weight is: (0/36864). Sparsity is: 0.00%
-    #       ...
-    #       ...
-    # ---------------------------------------------------------------------------
-    # total number of zeros: 0, non-zeros: 9402048, overall sparsity is: 0.0000
+    # 1) Validate mode
+    if sparsity_type not in ("unstructured", "filter"):
+        raise ValueError(f"Unsupported sparsity_type={sparsity_type}")
 
-    # For sparisty_type="filter":
+    # 2) Global accumulators
+    total_zeros = 0       # for unstructured
+    total_params = 0
+    total_empty = 0       # for filter
+    total_filters = 0
 
-    # (empty/total) filter of features.0.weight is: (0/64). filter sparsity is: 0.00%
-    # (empty/total) filter of features.3.weight is: (0/64). filter sparsity is: 0.00%
-    #       ...
-    #       ...
-    # ---------------------------------------------------------------------------
-    # total number of filters: 2944, empty-filters: 0, overall filter sparsity is: 0.0000
-    pass
+    print(f"Sparsity type is: {sparsity_type}")
+
+    # 3) Iterate through all parameters
+    for name, p in model.named_parameters():
+        w = p.data
+
+        if sparsity_type == "unstructured":
+            # 3.1) Count zeros for any shape
+            zeros = (w == 0).sum().item()
+            params = w.numel()
+            total_zeros += zeros
+            total_params += params
+            print(f"(zero/total) weights of {name} is: ({zeros}/{params}). Sparsity is: {zeros/params:.4f}")
+        else:
+            # 3.2) Filter pruning only makes sense for conv weights: [OC, IC, kH, kW]
+            oc = w.size(0)
+            flat = w.view(oc, -1).abs().sum(dim=1)
+            empty = (flat == 0).sum().item()
+            total_empty += empty
+            total_filters += oc
+            print(f"(empty/total) filter of {name} is: ({empty}/{oc}). filter sparsity is: {empty / oc:.4f}")
+
+    # 4) Print global stats
+    print("-" * 75)
+    if sparsity_type == "unstructured":
+        overall = total_zeros / total_params if total_params else 0.0
+        print(f"total number of zeros: {total_zeros}, non-zeros: {total_params - total_zeros}, overall sparsity is: {overall:.4f}")
+    else:
+        overall = total_empty / total_filters if total_filters else 0.0
+        print(f"total number of filters: {total_filters}, empty-filters: {total_empty}, overall filter sparsity is: {overall:.4f}")
 
 
 def masked_retrain():
@@ -348,22 +455,6 @@ def prune_channels_after_filter_prune():
     # 4. Can we apply this function to ResNet and get the same conclusion? Why?
     pass
 
-def _debug_test_unstructured(model):
-    # pick first conv
-    layer = dict(model.named_parameters())["features.0.weight"]
-    sparsity = 0.80
-    mask = unstructured_prune(layer.data, sparsity)
-
-    # apply (just locally)
-    pruned = layer.data * mask
-
-    numel = layer.numel()
-    zeros = (mask == 0).sum().item()
-    print(f"[DEBUG] features.0.weight -> target={sparsity:.2f}, zeros={zeros}/{numel} = {zeros/numel:.4f}")
-    # sanity: original tensor should not have changed in model params here
-    # we didn't assign back; if you want to see it, assign:
-    # layer.data = pruned
-
 
 def main():
 
@@ -399,12 +490,11 @@ def main():
 
     # ========= your code starts here ========
 
-    # 1) check YAML
     prune_dict = read_prune_ratios_from_yaml(args.yaml_path, model)
     print("[INFO] YAML OK:", prune_dict)
+    masks = apply_pruning(model, prune_dict, args.sparsity_type)
+    test_sparsity(model, args.sparsity_type)
 
-    # 2) quick pruning smoke test
-    _debug_test_unstructured(model)
     """
         main()
             |- read_prune_ratios_from_yaml()
