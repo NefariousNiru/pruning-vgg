@@ -421,9 +421,13 @@ def masked_retrain(
 
     model.train()
 
+    # remove this line later
+    from tqdm import tqdm
+
     # 1) Loop over epochs
     for epoch in range(epochs):
         # 1.1) Loop over mini-batches
+        train_loader = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="batch")
         for images, targets in train_loader:
             # 2) Move batch to device
             images = images.to(device)
@@ -448,6 +452,9 @@ def masked_retrain(
             # 6) Optional LR schedule per step
             if scheduler is not None:
                 scheduler.step()
+
+            # Remove this line later
+            train_loader.set_postfix(loss=loss.item())
 
 def oneshot_magnitude_prune(model, sparity_type, prune_ratio_dict):
     # Implement the function that conducting oneshot magnitude pruning
@@ -501,43 +508,47 @@ def prune_channels_after_filter_prune():
 
 def main():
 
+    # 0) Check Device
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    # setup random seed
+    # 1) setup random seed
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if use_cuda:
         torch.cuda.manual_seed(args.seed)
-
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # set up model architecture and load pretrained dense model
-
+    # 2) Load PT model
     model = vgg13()
     model.load_state_dict(torch.load(args.load_model_path, map_location=device))
     if use_cuda:
         model.cuda()
 
+    # 3) Data loaders
     train_loader, test_loader = get_dataloaders(args)
 
-    # Select loss function. You may change to whatever loss function you want.
+    # 4) CE Loss Function + Optimizer
     criterion = nn.CrossEntropyLoss()
-
-    # Select optimizer. You may change to whatever optimizer you want.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
     
-    # you may use this lr scheduler to fine-tune/mask-retrain your pruned model.
+    # 5) lr scheduler to fine-tune/mask-retrain your pruned model.
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader), eta_min=4e-08)
 
-    # ========= your code starts here ========
-
+    # 6) Read prune ratio from yaml
     prune_dict = read_prune_ratios_from_yaml(args.yaml_path, model)
+
+    # 7) Apply Masking
     masks = apply_pruning(model, prune_dict, args.sparsity_type)
+
+    # 8) Test Sparsity with mask
     test_sparsity(model, args.sparsity_type)
 
+    # 9) Retrain with mask
     masked_retrain(model=model, masks=masks, train_loader=train_loader, device=device, optimizer=optimizer, criterion=criterion, scheduler=scheduler, epochs=args.epochs)
+
+    # 10) Sanity check to make sure model is still sparse and mask is working
     test_sparsity(model, args.sparsity_type)
 
     """
