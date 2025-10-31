@@ -1,8 +1,9 @@
 """
 file: main.py
 
-Implementation file
+Implementation file for pruning
 """
+
 from __future__ import print_function
 import os
 import sys
@@ -279,7 +280,6 @@ def filter_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
     return mask
 
 
-
 def apply_pruning(model: nn.Module, prune_ratio_dict: dict, sparsity_type: str) -> dict[str, torch.Tensor]:
     """Apply in-place pruning to selected conv layers of a model.
 
@@ -387,24 +387,67 @@ def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -
         print(f"total number of filters: {total_filters}, empty-filters: {total_empty}, overall filter sparsity is: {overall:.4f}")
 
 
-def masked_retrain():
-    # when you fine-tune your pruned model, you only want to update the remaining weights (i.e., the weights that are not pruned),
-    # while keeping the pruned weights to be 0.
-    # A simple way to achieve this is:
-    #   1. before update the weights, you find the pruning mask first.
-    #   2. update all weights (including both remained and pruned weights).
-    #   3. based on the pruning mask, prune the weights again.
-    #      In this way, you can "keep" the pruned weights to be 0 after a training iteration.
+def masked_retrain(
+    *,
+    model: nn.Module,
+    masks: dict,
+    train_loader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    criterion: torch.nn.Module,
+    scheduler=None,
+    epochs: int = 15,
+) -> None:
+    """Finetune a pruned model while keeping previously pruned weights zero.
 
-    # Example:
-    # For each training iteration
-    #       ...
-    #       optimizer.zero_grad()
-    #       loss.backward()
-    #       optimizer.step()
-    #       # Here you may need a loop to loop over entire model layer by layer, then
-    #       weight = weight * mask 
-    pass
+    After each optimizer step, this re-applies the stored masks so that
+    gradients cannot revive pruned weights.
+
+    Args:
+        model (nn.Module): Pruned model to retrain.
+        masks (dict[str, torch.Tensor]): Dict mapping param name -> 0/1 mask
+            with same shape as the parameter.
+        train_loader (DataLoader): Training data loader.
+        device (torch.device): Device to run training on.
+        optimizer (torch.optim.Optimizer): Optimizer for model params.
+        criterion (torch.nn.Module): Criterion for model params.
+        scheduler (optional): LR scheduler. Called once per batch if provided.
+        epochs (int): Number of training epochs.
+
+    Notes:
+        - This applies scheduler.step() per batch, not per epoch.
+        - Only parameters whose names appear in `masks` are forced back to zero.
+    """
+
+    model.train()
+
+    # 1) Loop over epochs
+    for epoch in range(epochs):
+        # 1.1) Loop over mini-batches
+        for images, targets in train_loader:
+            # 2) Move batch to device
+            images = images.to(device)
+            targets = targets.to(device)
+
+            # 3) Forward + loss
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+
+            # 4) Backward + update
+            loss.backward()
+            optimizer.step()
+
+            # 5) Re-apply masks to keep pruned weights at 0
+            # 5.1) Only touch params that have a corresponding mask
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if name in masks:
+                        p.data *= masks[name]
+
+            # 6) Optional LR schedule per step
+            if scheduler is not None:
+                scheduler.step()
 
 def oneshot_magnitude_prune(model, sparity_type, prune_ratio_dict):
     # Implement the function that conducting oneshot magnitude pruning
@@ -470,7 +513,7 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # set up model archetecture and load pretrained dense model
+    # set up model architecture and load pretrained dense model
 
     model = vgg13()
     model.load_state_dict(torch.load(args.load_model_path, map_location=device))
@@ -491,8 +534,10 @@ def main():
     # ========= your code starts here ========
 
     prune_dict = read_prune_ratios_from_yaml(args.yaml_path, model)
-    print("[INFO] YAML OK:", prune_dict)
     masks = apply_pruning(model, prune_dict, args.sparsity_type)
+    test_sparsity(model, args.sparsity_type)
+
+    masked_retrain(model=model, masks=masks, train_loader=train_loader, device=device, optimizer=optimizer, criterion=criterion, scheduler=scheduler, epochs=args.epochs)
     test_sparsity(model, args.sparsity_type)
 
     """
