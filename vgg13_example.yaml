@@ -1,0 +1,17 @@
+# This yaml file defines the layer-wise pruning ratio.
+# The following code is an example, and you need to finish the whole file.
+# You need to list all the layer names you that want to prune and provide corssesponding prune ratio.
+# Due to the existence of BN layer, ReLU layer, and pooling layer, the numbers of adjacent conv layers are often not adjacent.
+# For example, 
+# the name of 1st conv layer in vgg13 is features.0.weight
+# the name of 2nd conv layer in vgg13 is features.3.weight
+# You need to find the layer name from the model.
+
+# An empirical conclusion is that we prefer to not prune the first Conv layer and last FC layer,
+# due to they are usually more sensitive to the pruning and have fewer number of weights.
+
+prune_ratios:
+  features.0.weight:
+    0.0
+  features.3.weight:
+    0.5
