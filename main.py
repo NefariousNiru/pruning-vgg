@@ -93,33 +93,65 @@ def get_dataloaders(args):
 # ============= the functions that you need to complete start from here =============
 
 def read_prune_ratios_from_yaml(file_name, model):
+    """Load and validate layer-wise prune ratios from a YAML file.
 
-        """
-            This function will read user-defined layer-wise target pruning ratios from yaml file.
-            The ratios are stored in "prune_ratio_dict" dictionary, 
-            where the key is the layer name and value is the corresponding pruning ratio.
+    This reads a YAML config that is expected to contain a top-level key
+    `prune_ratios`, where each key is a parameter name in the model and each
+    value is a pruning ratio between 0.0 and 1.0 (inclusive). It validates that
+    all keys exist in the model and that all ratios are within range.
 
-            Your task:
-                Write a snippet of code to check if the layer names you provided in yaml file match the real layer name in the model.
-                This can make sure your yaml file is correctly written.
-        """
+    Args:
+        file_name (str): Path to the YAML configuration file.
+        model (torch.nn.Module): Model whose parameter names are used to
+            validate the YAML entries.
 
-        if not isinstance(file_name, str):
-            raise Exception("filename must be a str")
-        with open(file_name, "r") as stream:
-            try:
-                raw_dict = yaml.safe_load(stream)
-                prune_ratio_dict = raw_dict['prune_ratios']
+    Returns:
+        dict[str, float]: Mapping of parameter name to pruning ratio.
 
-                # ===== your code starts from here ======
+    Raises:
+        TypeError: If `file_name` is not a string.
+        ValueError: If a layer in YAML does not exist in the model, or if a
+            pruning ratio is not in [0.0, 1.0].
+        yaml.YAMLError: If the YAML file cannot be parsed.
+    """
 
+    # 1) Basic type check for file path
+    if not isinstance(file_name, str):
+        raise TypeError("filename must be a str")
 
-                # ===== your code ends here ======
+    # 2) Open YAML file for reading
+    with open(file_name, "r") as stream:
+        try:
+            # 2.1) Load raw YAML as Python dict
+            raw_dict = yaml.safe_load(stream)
 
-                return prune_ratio_dict
+            # 2.2) Extract the prune section that should exist
+            prune_ratio_dict = raw_dict["prune_ratios"]
 
-            except yaml.YAMLError as exc:
-                print(exc)
+            # 3) Collect all real parameter names from the model for validation
+            model_param_names = set(name for name, _ in model.named_parameters())
+
+            # 4) Validate every YAML entry
+            for layer_name, ratio in prune_ratio_dict.items():
+                # 4.1) Check that layer exists in the model
+                if layer_name not in model_param_names:
+                    raise ValueError(
+                        f"[YAML ERROR] {layer_name} not found in model params. "
+                        f"Available examples: {[n for n in list(model_param_names)[:15]]}"
+                    )
+
+                # 4.2) Check that ratio is a valid float in [0.0, 1.0]
+                if not (0.0 <= float(ratio) <= 1.0):
+                    raise ValueError(
+                        f"[YAML ERROR] {layer_name} has invalid ratio {ratio}"
+                    )
+
+            # 5) If all checks pass, return the validated dict
+            return prune_ratio_dict
+
+        except yaml.YAMLError as exc:
+            # 6) Surface YAML parsing issues to the caller/log
+            raise exc
 
 
 def unstructured_prune(tensor: torch.Tensor, sparsity : float) -> torch.Tensor:
@@ -147,6 +179,7 @@ def unstructured_prune(tensor: torch.Tensor, sparsity : float) -> torch.Tensor:
     ##################### YOUR CODE ENDS HERE #######################
 
     # return the mask to record the pruning location ()
+    return
     return mask
 
 
@@ -175,6 +208,7 @@ def filter_prune(tensor: torch.Tensor, sparsity : float) -> torch.Tensor:
     ##################### YOUR CODE ENDS HERE #######################
 
     # return the mask to record the pruning location ()
+    return
     return mask
 
 
@@ -184,6 +218,7 @@ def apply_pruning():
     # call unstructured_prune()  
     # or 
     # call filter_prune (...)
+    pass
 
 
 def test_sparsity(model, sparisty_type):
@@ -217,6 +252,7 @@ def test_sparsity(model, sparisty_type):
     #       ...
     # ---------------------------------------------------------------------------
     # total number of filters: 2944, empty-filters: 0, overall filter sparsity is: 0.0000
+    pass
 
 
 def masked_retrain():
@@ -236,13 +272,14 @@ def masked_retrain():
     #       optimizer.step()
     #       # Here you may need a loop to loop over entire model layer by layer, then
     #       weight = weight * mask 
-
+    pass
 
 def oneshot_magnitude_prune(model, sparity_type, prune_ratio_dict):
     # Implement the function that conducting oneshot magnitude pruning
     # Target sparsity ratio dict should contains the sparsity ratio of each layer
     # the per-layer sparsity ratio should be read from a external .yaml file
     # This function should also include the masked_retrain() function to conduct fine-tuning to restore the accuracy
+    pass
 
 def iterative_magnitude_prune():
     # Implement the function that conducting iterative magnitude pruning
@@ -254,6 +291,7 @@ def iterative_magnitude_prune():
     # At each sparsity level, you need to retrain your model. 
     # Therefore, this IMP method requires more overall training epochs than OMP.
     # ** IMP method needs to use at least 3 iterations.
+    pass
 
 def prune_channels_after_filter_prune():
     # 
@@ -283,7 +321,7 @@ def prune_channels_after_filter_prune():
     # 2. Will accuray decrease, increase, or not change?
     # 3. Based on question 2, explain why?
     # 4. Can we apply this function to ResNet and get the same conclusion? Why?
-
+    pass
 
 def main():
 
@@ -302,7 +340,7 @@ def main():
     # set up model archetecture and load pretrained dense model
 
     model = vgg13()
-    model.load_state_dict(torch.load(args.load_model_path))
+    model.load_state_dict(torch.load(args.load_model_path, map_location=device))
     if use_cuda:
         model.cuda()
 
@@ -318,6 +356,8 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader), eta_min=4e-08)
 
     # ========= your code starts here ========
+    dict_ratio = read_prune_ratios_from_yaml("vgg13_example.yaml", model)
+    print(dict_ratio)
     """
         main()
             |- read_prune_ratios_from_yaml()
