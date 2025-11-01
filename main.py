@@ -356,7 +356,7 @@ def apply_pruning(model: nn.Module, prune_ratio_dict: dict, sparsity_type: str) 
         sparsity_type (str): Either "unstructured" or "filter".
 
     Returns:
-        dict[str, torch.Tensor]: Mapping from parameter name to pruned weights.
+        dict[str, torch.Tensor]: Masks.
 
     Raises:
         ValueError: If `sparsity_type` is not recognized.
