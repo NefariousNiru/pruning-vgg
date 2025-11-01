@@ -679,36 +679,51 @@ def iterative_magnitude_prune(
     return model, last_masks, acc, sparsity
 
 
-def prune_channels_after_filter_prune():
-    # 
-    # You need to implement this function to complete the following task:
-    # 1. This function takes a filter pruned and fine-tuned model as input
-    # 2. Find out the indices of all pruned filters in each CONV layer
-    # 3. Directly prune the corresponding channels (that has the same indices) in next CONV layer (on top of the filter-pruned model).
-    #    There is no need to fine-tune this model again.
-    # 4. Return the newly pruned model
+def prune_channels_after_filter_prune(model: nn.Module):
+    """
+    Post-processing step for FILTER-pruned VGG-like models.
 
-    # E.g., if you prune the filter_1, filter_4, filter_7 from the i_th CONV layer,
-    # Then, this function will let you prune the Channel_1, Channel_4, Channel_7, from the next CONV layer, i.e., (i+1)_th CONV layer.
+    1. Scan conv_i to find filters that are completely pruned (all zeros).
+    2. In conv_{i+1}, zero the input channels with the same indices.
+    3. Do not fine-tune again.
+    4. Return the updated model.
 
-    # How to use this function:
-    # 1. You will apply this function on a filter-pruned model (after fine-tune/mask retraine)
-    # 2. There is no need to fine-tune the model again after apply this function
-    # 3. Compare the test accuracy before and after apply this function
-    #   
-    # E.g., 
-    #       pruned_model = your pruned and fine/tuned model
-    #       test_accuracy(pruned_model)
-    #       new_model = prune_channels_after_filter_prune(pruned_model)
-    #       test_accuracy(new_model)
+    Assumptions:
+    - Model is VGG13-style, i.e. convs appear in order inside model.features.
+    - Filter pruning already produced exact-zero filters in conv layers.
+    - We only propagate to the next CONV layer (not to FC).
+    """
 
-    # Answer the following questions in your report:
-    # 1. After apply this function (further prune the corresponding channels), what is the change in sparsity?
-    # 2. Will accuray decrease, increase, or not change?
-    # 3. Based on question 2, explain why?
-    # 4. Can we apply this function to ResNet and get the same conclusion? Why?
-    pass
+    # 1) collect conv layers in order
+    conv_layers: list[tuple[str, nn.Conv2d]] = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            conv_layers.append((name, module))
 
+    # 2) for each conv, find zero filters and apply to next conv
+    for idx, (name, conv) in enumerate(conv_layers):
+        w = conv.weight.data  # [OC, IC, kH, kW]
+        oc = w.size(0)
+
+        # 2.1) flatten per filter to detect all-zero filters
+        flat = w.view(oc, -1).abs().sum(dim=1)  # [OC]
+        pruned_idx = (flat == 0).nonzero(as_tuple=False).view(-1)  # indices of dead filters
+
+        if pruned_idx.numel() == 0:
+            continue  # nothing to propagate
+
+        # 2.2) if there is a next conv, zero the corresponding input channels there
+        if idx + 1 < len(conv_layers):
+            next_name, next_conv = conv_layers[idx + 1]
+            w_next = next_conv.weight.data  # [OC2, IC2, kH, kW]
+
+            # 2.3) guard: if next conv has fewer input channels than max(pruned_idx), skip bad ones
+            valid_mask = pruned_idx < w_next.size(1)
+            good_idx = pruned_idx[valid_mask]
+            if good_idx.numel() > 0:
+                w_next[:, good_idx, :, :] = 0
+
+    return model
 
 def main():
 
@@ -787,6 +802,13 @@ def main():
 
     # 9) save model
     torch.save(model.state_dict(), model_fname)
+
+    # 10) Print Channel Prune
+    if args.sparsity_type == "filter":
+        channel_prune_model = prune_channels_after_filter_prune(model)
+        channel_prune_overall_sparsity = test_sparsity(channel_prune_model, sparsity_type="filter")
+        channel_prune_acc = test(channel_prune_model, device, test_loader)
+        print(f"channel_prune_acc: {channel_prune_acc:.3f}, channel_prune_overall_sparsity: {channel_prune_overall_sparsity}")
 
 
 if __name__ == '__main__':
