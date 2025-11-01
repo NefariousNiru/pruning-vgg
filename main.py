@@ -33,6 +33,7 @@ parser.add_argument('--sparsity-method', type=str, default='omp',
 parser.add_argument('--yaml-path', type=str, default="./vgg13.yaml",
                     help='Path to yaml file')
 parser.add_argument('--test-dense', type=bool, default=False, help='Test dense model')
+parser.add_argument('--channel-prune', type=bool, default=False, help='Channel pruning mode. Run when models are available.')
 
 args = parser.parse_args()
 
@@ -739,6 +740,20 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # 1.5) Check if channel prune mode and sparsity type is filter
+    if args.sparsity_type == "filter":
+        for path in ["imp_filter_0.40_acc_93.280.pt", "omp_filter_0.40_acc_93.500.pt"]:
+            model = vgg13()
+            model.load_state_dict(torch.load(path, map_location=device))
+            if use_cuda:
+                model.cuda()
+            train_loader, test_loader = get_dataloaders(args)
+            channel_prune_model = prune_channels_after_filter_prune(model)
+            channel_prune_overall_sparsity = test_sparsity(channel_prune_model, sparsity_type="filter")
+            channel_prune_acc = test(channel_prune_model, device, test_loader)
+            print(f"sparsity method: {path[0:3]}, channel_prune_acc: {channel_prune_acc:.3f}, channel_prune_overall_sparsity: {channel_prune_overall_sparsity}")
+        exit(0)
+
     # 2) Load PT model
     model = vgg13()
     model.load_state_dict(torch.load(args.load_model_path, map_location=device))
@@ -802,13 +817,6 @@ def main():
 
     # 9) save model
     torch.save(model.state_dict(), model_fname)
-
-    # 10) Print Channel Prune
-    if args.sparsity_type == "filter":
-        channel_prune_model = prune_channels_after_filter_prune(model)
-        channel_prune_overall_sparsity = test_sparsity(channel_prune_model, sparsity_type="filter")
-        channel_prune_acc = test(channel_prune_model, device, test_loader)
-        print(f"channel_prune_acc: {channel_prune_acc:.3f}, channel_prune_overall_sparsity: {channel_prune_overall_sparsity}")
 
 
 if __name__ == '__main__':
