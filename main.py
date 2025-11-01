@@ -52,11 +52,12 @@ def test(model, device, test_loader):
     model.eval()
     test_loss = 0
     correct = 0
+    criterion = nn.CrossEntropyLoss()
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
+            test_loss += criterion(output, target).item() * data.size(0)
             pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
 
@@ -377,8 +378,8 @@ def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -
             total_zeros += zeros
             total_params += params
             layer_sparse_pct = (zeros / params * 100.0) if params > 0 else 0.0
-            print("(zero/total) weights of {} is: ({}/{}){}. Sparsity is: {:.2f}%".format(
-                name, zeros, params, "" if params > 0 else "", layer_sparse_pct
+            print("(zero/total) weights of {} is: ({}/{}). Sparsity is: {:.2f}%".format(
+                name, zeros, params, layer_sparse_pct
             ))
         else:
             # 3.2) Filter pruning only makes sense for conv weights: [OC, IC, kH, kW]
@@ -576,10 +577,12 @@ def iterative_magnitude_prune(
         raise ValueError(f"unsupported sparsity_type={sparsity_type}")
 
     # 2) Iter through stages
-    acc_history = []
     last_masks: dict[str, torch.Tensor] = {}
-    per_stage_epoch = base_epochs
-    for stage_idx, stage_target in enumerate(stage_targets, start=1):
+    stage_epochs = [15, 12, 12, 15]
+    stage_lrs = [0.02, 0.02, 0.01, 0.01]
+    for stage_idx, (stage_target, epochs, lr) in enumerate(
+            zip(stage_targets, stage_epochs, stage_lrs), start=1
+    ):
         # 1.1) build stage-specific ratios
         stage_prune_dict = {}
         scale = stage_target / final_target
@@ -596,20 +599,12 @@ def iterative_magnitude_prune(
         masks = apply_pruning(model, stage_prune_dict, sparsity_type)
         test_sparsity(model, sparsity_type)
 
-        # 1.3) Stage wise lr + epoch
-        if stage_idx <= 2:
-            lr = 0.02
-            per_stage_epoch -= int(0.2 * per_stage_epoch)
-        else:
-            lr = 0.01
-            per_stage_epoch += int(0.2 * per_stage_epoch)
-
-        # 1.4) Masked retrain with small LR + cosine
+        # 1.3) Masked retrain with small LR + cosine
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4,)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * per_stage_epoch, eta_min=4e-8,)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs, eta_min=4e-8)
         criterion = nn.CrossEntropyLoss()
 
-        # 1.5) Retrain
+        # 1.4) Retrain
         masked_retrain(
             model=model,
             masks=masks,
@@ -618,13 +613,12 @@ def iterative_magnitude_prune(
             optimizer=optimizer,
             criterion=criterion,
             scheduler=scheduler,
-            epochs=per_stage_epoch,
+            epochs=epochs,
         )
         print(f"Stage {stage_idx}/{len(stage_targets)}") # remove later
 
-        # 1.6) Evaluate
+        # 1.5) Evaluate
         acc = test(model, device, test_loader)
-        acc_history.append(acc)
         last_masks = masks
 
     # 2) Final accuracy

@@ -1,0 +1,22 @@
+# At least 80% sparseness
+prune_ratios:
+  # sensitive - don't touch
+  features.0.weight: 0.0
+
+  # 128-ch block - light
+  features.3.weight: 0.20
+
+  # 256-ch block - moderate
+  features.7.weight: 0.55
+  features.10.weight: 0.55
+
+  # 512-ch blocks - aggressive
+  features.14.weight: 0.75
+  features.17.weight: 0.75
+  features.21.weight: 0.80
+  features.24.weight: 0.80
+  features.28.weight: 0.85
+  features.31.weight: 0.85
+
+  # last FC - keep
+  classifier.weight: 0.0

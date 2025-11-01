@@ -1,0 +1,22 @@
+# At least 40% total sparseness
+prune_ratios:
+  # 0 pruning in first layer
+  features.0.weight: 0.0
+
+  # 128
+  features.3.weight: 0.10
+
+  # 256
+  features.7.weight: 0.25
+  features.10.weight: 0.30
+
+  # 512 - slightly higher
+  features.14.weight: 0.35
+  features.17.weight: 0.35
+  features.21.weight: 0.40
+  features.24.weight: 0.45
+  features.28.weight: 0.50
+  features.31.weight: 0.55
+
+  # 0 pruning in last FC
+  classifier.weight: 0.0
