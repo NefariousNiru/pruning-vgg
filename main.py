@@ -18,7 +18,9 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 import numpy as np
 import yaml
-
+import csv
+from pathlib import Path
+from datetime import datetime
 from vgg_cifar import vgg13
 
 # settings
@@ -48,6 +50,7 @@ args = parser.parse_args()
 # ]
 # args = parser.parse_args(args_list)
 
+
 def test(model, device, test_loader):
     model.eval()
     test_loss = 0
@@ -68,6 +71,7 @@ def test(model, device, test_loader):
         test_loss, correct, len(test_loader.dataset), accuracy))
 
     return accuracy
+
 
 def get_dataloaders(args):
     train_loader = torch.utils.data.DataLoader(
@@ -92,7 +96,63 @@ def get_dataloaders(args):
     return train_loader, test_loader
 
 
+RUN_LOG_CSV = "runs.csv"
+MASK_DIR = Path("masks")
+MASK_DIR.mkdir(exist_ok=True, parents=True)
+
+
+def save_run_row(
+    *,
+    sparsity_method: str,
+    sparsity_type: str,
+    target_sparsity: float,
+    achieved_sparsity: float,
+    accuracy: float,
+    yaml_path: str,
+    model_path: str,
+) -> None:
+    header = [
+        "timestamp",
+        "sparsity_method",
+        "sparsity_type",
+        "target_sparsity",
+        "achieved_sparsity",
+        "accuracy",
+        "yaml_path",
+        "model_path",
+    ]
+    file_exists = Path(RUN_LOG_CSV).exists()
+    with open(RUN_LOG_CSV, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(header)
+        writer.writerow([
+            datetime.now().isoformat(timespec="seconds"),
+            sparsity_method,
+            sparsity_type,
+            f"{target_sparsity:.2f}",
+            f"{achieved_sparsity:.4f}",
+            f"{accuracy:.4f}",
+            yaml_path,
+            model_path,
+        ])
+
+
+def save_layer_mask_snapshot(model: nn.Module, layer_name: str, tag: str) -> None:
+    # will store a 0/1 tensor extracted from current model weights
+    for name, p in model.named_parameters():
+        if name == layer_name:
+            w = p.data
+            if w.dim() == 4:
+                mask = (w != 0).to(dtype=torch.uint8)
+            else:
+                mask = (w != 0).to(dtype=torch.uint8)
+            out_path = MASK_DIR / f"{tag}_{layer_name.replace('.', '_')}.pt"
+            torch.save(mask.cpu(), out_path)
+            return
+
 # ============= the functions that you need to complete start from here =============
+
 
 def read_prune_ratios_from_yaml(file_name, model):
     """
@@ -340,7 +400,7 @@ def apply_pruning(model: nn.Module, prune_ratio_dict: dict, sparsity_type: str) 
     return masks
 
 
-def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -> None:
+def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -> float:
     """Print per-layer and overall sparsity statistics for a model.
 
     Supports:
@@ -404,6 +464,7 @@ def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -
             total_params - total_zeros,
             overall,
         ))
+        return overall
     else:
         overall = (total_empty / total_filters) if total_filters > 0 else 0.0
         print("total number of filters: {}, empty-filters: {}, overall filter sparsity is: {:.4f}".format(
@@ -411,6 +472,7 @@ def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -
             total_empty,
             overall,
         ))
+        return overall
 
 
 def masked_retrain(
@@ -492,7 +554,7 @@ def oneshot_magnitude_prune(
     sparsity_type: str,
     prune_ratio_dict: dict,
     base_epochs: int = 15,
-):
+) -> tuple[nn.Module, dict, float, float]:
     """One-shot pruning + masked finetuning + eval.
 
     Steps:
@@ -510,12 +572,12 @@ def oneshot_magnitude_prune(
         base_epochs (int): Finetune epochs after pruning.
 
     Returns:
-        Tuple[nn.Module, dict, float]: (pruned+retrained model, masks, test_acc)
+        Tuple[nn.Module, dict, float, float]: (pruned+retrained model, masks, test_acc, overall_sparseness)
     """
 
     # 1) Prune once using YAML ratios; make sure apply_pruning returns masks: name -> mask tensor
     masks = apply_pruning(model, prune_ratio_dict, sparsity_type)
-    test_sparsity(model, sparsity_type)
+    overall_sparsity = test_sparsity(model, sparsity_type)
 
     # 2) Masked retrain with small LR + cosine
     optimizer = torch.optim.SGD(model.parameters(),lr=0.01,momentum=0.9,weight_decay=1e-4,)
@@ -536,7 +598,8 @@ def oneshot_magnitude_prune(
 
     # 3) Final accuracy
     acc = test(model, device, test_loader)
-    return model, masks, acc
+    save_layer_mask_snapshot(model, "features.21.weight", tag=f"omp_{sparsity_type}")
+    return model, masks, acc, overall_sparsity
 
 
 def iterative_magnitude_prune(
@@ -548,7 +611,7 @@ def iterative_magnitude_prune(
     sparsity_type: str,
     prune_ratio_dict: dict,
     base_epochs: int = 15,
-) -> tuple[nn.Module, dict, float]:
+) -> tuple[nn.Module, dict, float, float]:
     """Iterative Magnitude Pruning (IMP) with masked finetuning at each stage.
 
     We do pruning in T (4 in this case) stages.
@@ -563,7 +626,7 @@ def iterative_magnitude_prune(
         base_epochs (int): Finetune epochs per round.
 
     Returns:
-        Tuple[nn.Module, float]: Final pruned model and test accuracy.
+        Tuple[nn.Module, dict, float, float]: (pruned+retrained model, masks, test_acc, overall_sparseness)
     """
 
     # 1) Decide stages of iteration based on sparsity type
@@ -623,7 +686,9 @@ def iterative_magnitude_prune(
 
     # 2) Final accuracy
     acc = test(model, device, test_loader)
-    return model, last_masks, acc
+    final_overall = test_sparsity(model, sparsity_type)
+    save_layer_mask_snapshot(model, "features.21.weight", tag=f"imp_{sparsity_type}")
+    return model, last_masks, acc, final_overall
 
 
 def prune_channels_after_filter_prune():
@@ -685,7 +750,7 @@ def main():
 
     # 5) Run OMP or IMP
     if args.sparsity_method == "omp":
-        model, masks, acc = oneshot_magnitude_prune(
+        model, masks, acc, overall_sparsity = oneshot_magnitude_prune(
             model=model,
             device=device,
             train_loader=train_loader,
@@ -695,7 +760,7 @@ def main():
             base_epochs=15,
         )
     elif args.sparsity_method == "imp":
-        model, masks, acc = iterative_magnitude_prune(
+        model, masks, acc, overall_sparsity = iterative_magnitude_prune(
             model=model,
             device=device,
             train_loader=train_loader,
@@ -707,11 +772,30 @@ def main():
     else:
         raise ValueError(f"unrecognized sparsity method: {args.sparsity_method}")
 
-    # 8) Save model
-    target = "0.80" if args.sparsity_type == "unstructured" else "0.40"
-    fname = f"{args.sparsity_method}_{args.sparsity_type}_{target}_acc_{acc:.3f}.pt"
-    torch.save(model.state_dict(), fname)
-    print(f"[INFO] saved {fname}")
+    # 6) single source of truth for target sparsity string and float
+    if args.sparsity_type == "unstructured":
+        target_str = "0.80"
+        target_float = 0.80
+    else:
+        target_str = "0.40"
+        target_float = 0.40
+
+    model_fname = f"{args.sparsity_method}_{args.sparsity_type}_{target_str}_acc_{acc:.3f}.pt"
+
+    # 7) log run for plotting later
+    save_run_row(
+        sparsity_method=args.sparsity_method,
+        sparsity_type=args.sparsity_type,
+        target_sparsity=target_float,
+        achieved_sparsity=overall_sparsity,
+        accuracy=acc,
+        yaml_path=args.yaml_path,
+        model_path=model_fname,
+    )
+
+    # 8) save model
+    torch.save(model.state_dict(), model_fname)
+    print(f"[INFO] saved {model_fname}")
 
 
 if __name__ == '__main__':
