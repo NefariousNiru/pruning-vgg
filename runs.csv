@@ -1,0 +1,6 @@
+timestamp,sparsity_method,sparsity_type,target_sparsity,achieved_sparsity,accuracy,yaml_path,model_path
+2025-11-01T02:13:03,omp,unstructured,0.80,0.8111,93.6900,./vgg13_unstructured.yaml,omp_unstructured_0.80_acc_93.690.pt
+2025-11-01T02:29:18,omp,filter,0.40,0.4161,93.5000,./vgg13_filter.yaml,omp_filter_0.40_acc_93.500.pt
+2025-11-01T02:45:29,imp,filter,0.40,0.4161,93.2800,./vgg13_filter.yaml,imp_filter_0.40_acc_93.280.pt
+2025-11-01T03:01:09,imp,unstructured,0.80,0.8111,93.7400,./vgg13_unstructured.yaml,imp_unstructured_0.80_acc_93.740.pt
+2025-11-01T03:44:50,omp,unstructured,0.80,0.8111,93.6900,./vgg13_unstructured.yaml,omp_unstructured_0.80_acc_93.690.pt

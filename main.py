@@ -4,17 +4,10 @@ file: main.py
 Implementation file for pruning
 """
 
-from __future__ import print_function
-import os
-import sys
-import logging
 import argparse
-import time
-from time import strftime
 import torch
 import torch.optim as optim
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import datasets, transforms
 import numpy as np
 import yaml
@@ -39,6 +32,7 @@ parser.add_argument('--sparsity-method', type=str, default='omp',
                     help="define sparsity_method: [omp, imp, etc.]")
 parser.add_argument('--yaml-path', type=str, default="./vgg13.yaml",
                     help='Path to yaml file')
+parser.add_argument('--test-dense', type=bool, default=False, help='Test dense model')
 
 args = parser.parse_args()
 
@@ -509,13 +503,9 @@ def masked_retrain(
 
     model.train()
 
-    # remove this line later
-    from tqdm import tqdm
-
     # 1) Loop over epochs
     for epoch in range(epochs):
         # 1.1) Loop over mini-batches
-        train_loader = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="batch")
         for images, targets in train_loader:
             # 2) Move batch to device
             images = images.to(device)
@@ -540,9 +530,6 @@ def masked_retrain(
             # 6) Optional LR schedule per step
             if scheduler is not None:
                 scheduler.step()
-
-            # Remove this line later
-            train_loader.set_postfix(loss=loss.item())
 
 
 def oneshot_magnitude_prune(
@@ -641,8 +628,11 @@ def iterative_magnitude_prune(
 
     # 2) Iter through stages
     last_masks: dict[str, torch.Tensor] = {}
-    stage_epochs = [15, 12, 12, 15]
+    middle_epochs = int(base_epochs * 0.2)
+    end_epochs = base_epochs
+    stage_epochs = [end_epochs, middle_epochs, middle_epochs, end_epochs]
     stage_lrs = [0.02, 0.02, 0.01, 0.01]
+    sparsity, acc = None, None
     for stage_idx, (stage_target, epochs, lr) in enumerate(
             zip(stage_targets, stage_epochs, stage_lrs), start=1
     ):
@@ -660,7 +650,7 @@ def iterative_magnitude_prune(
 
         # 1.2) apply pruning for this stage
         masks = apply_pruning(model, stage_prune_dict, sparsity_type)
-        test_sparsity(model, sparsity_type)
+        sparsity = test_sparsity(model, sparsity_type)
 
         # 1.3) Masked retrain with small LR + cosine
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4,)
@@ -678,17 +668,15 @@ def iterative_magnitude_prune(
             scheduler=scheduler,
             epochs=epochs,
         )
-        print(f"Stage {stage_idx}/{len(stage_targets)}") # remove later
+        print(f"Iter Stage {stage_idx}/{len(stage_targets)}")
 
         # 1.5) Evaluate
         acc = test(model, device, test_loader)
         last_masks = masks
 
     # 2) Final accuracy
-    acc = test(model, device, test_loader)
-    final_overall = test_sparsity(model, sparsity_type)
     save_layer_mask_snapshot(model, "features.21.weight", tag=f"imp_{sparsity_type}")
-    return model, last_masks, acc, final_overall
+    return model, last_masks, acc, sparsity
 
 
 def prune_channels_after_filter_prune():
@@ -745,10 +733,14 @@ def main():
     # 3) Data loaders
     train_loader, test_loader = get_dataloaders(args)
 
-    # 4) Read prune ratio from yaml
+    # 4) If testing the full pretrained dense model
+    if args.test_dense:
+        test(model, device, test_loader)
+
+    # 5) Read prune ratio from yaml
     prune_dict = read_prune_ratios_from_yaml(args.yaml_path, model)
 
-    # 5) Run OMP or IMP
+    # 6) Run OMP or IMP
     if args.sparsity_method == "omp":
         model, masks, acc, overall_sparsity = oneshot_magnitude_prune(
             model=model,
@@ -772,7 +764,7 @@ def main():
     else:
         raise ValueError(f"unrecognized sparsity method: {args.sparsity_method}")
 
-    # 6) single source of truth for target sparsity string and float
+    # 7) single source of truth for target sparsity string and float
     if args.sparsity_type == "unstructured":
         target_str = "0.80"
         target_float = 0.80
@@ -782,7 +774,7 @@ def main():
 
     model_fname = f"{args.sparsity_method}_{args.sparsity_type}_{target_str}_acc_{acc:.3f}.pt"
 
-    # 7) log run for plotting later
+    # 8) log run for plotting later
     save_run_row(
         sparsity_method=args.sparsity_method,
         sparsity_type=args.sparsity_type,
@@ -793,9 +785,8 @@ def main():
         model_path=model_fname,
     )
 
-    # 8) save model
+    # 9) save model
     torch.save(model.state_dict(), model_fname)
-    print(f"[INFO] saved {model_fname}")
 
 
 if __name__ == '__main__':
