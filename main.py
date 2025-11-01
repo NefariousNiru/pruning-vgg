@@ -94,12 +94,13 @@ def get_dataloaders(args):
 # ============= the functions that you need to complete start from here =============
 
 def read_prune_ratios_from_yaml(file_name, model):
-    """Load and validate layer-wise prune ratios from a YAML file.
+    """
+    Read user-defined layer-wise target pruning ratios from YAML and
+    verify that the layer names exist in the model AND are prunable
+    (i.e. conv-like params, not BN, not bias, not classifier).
 
-    This reads a YAML config that is expected to contain a top-level key
-    `prune_ratios`, where each key is a parameter name in the model and each
-    value is a pruning ratio between 0.0 and 1.0 (inclusive). It validates that
-    all keys exist in the model and that all ratios are within range.
+    HW constraints:
+    - Only CONV layers need to be pruned / counted.
 
     Args:
         file_name (str): Path to the YAML configuration file.
@@ -118,41 +119,41 @@ def read_prune_ratios_from_yaml(file_name, model):
 
     # 1) Basic type check for file path
     if not isinstance(file_name, str):
-        raise TypeError("filename must be a str")
+        raise TypeError("[YAML ERROR] filename must be a str")
 
     # 2) Open YAML file for reading
     with open(file_name, "r") as stream:
-        try:
-            # 2.1) Load raw YAML as Python dict
-            raw_dict = yaml.safe_load(stream)
+        raw_dict = yaml.safe_load(stream)
+        prune_ratio_dict = raw_dict["prune_ratios"]
 
-            # 2.2) Extract the prune section that should exist
-            prune_ratio_dict = raw_dict["prune_ratios"]
+    # 3) Get Param Names
+    model_params = {name: p for name, p in model.named_parameters()}
 
-            # 3) Collect all real parameter names from the model for validation
-            model_param_names = set(name for name, _ in model.named_parameters())
+    # 4) Validated dict
+    validated: dict[str, float] = {}
 
-            # 4) Validate every YAML entry
-            for layer_name, ratio in prune_ratio_dict.items():
-                # 4.1) Check that layer exists in the model
-                if layer_name not in model_param_names:
-                    raise ValueError(
-                        f"[YAML ERROR] {layer_name} not found in model params. "
-                        f"Available examples: {[n for n in list(model_param_names)[:15]]}"
-                    )
+    # 5) Check each layer and ratio
+    for layer_name, ratio in prune_ratio_dict.items():
+        # 5.1) must exist
+        if layer_name not in model_params:
+            raise ValueError(f"[YAML ERROR] {layer_name} not found in model params.")
 
-                # 4.2) Check that ratio is a valid float in [0.0, 1.0]
-                if not (0.0 <= float(ratio) <= 1.0):
-                    raise ValueError(
-                        f"[YAML ERROR] {layer_name} has invalid ratio {ratio}"
-                    )
+        # 5.2) Get Param
+        p = model_params[layer_name]
 
-            # 5) If all checks pass, return the validated dict
-            return prune_ratio_dict
+        # 5.3) Must be a conv-like weight (4D); skip BN/bias/FC here
+        if p.dim() != 4:
+            continue
 
-        except yaml.YAMLError as exc:
-            # 6) Surface YAML parsing issues to the caller/log
-            raise exc
+        # 5.4) ratio must be in [0, 1]
+        r = float(ratio)
+        if not (0.0 <= r <= 1.0):
+            raise ValueError(f"[YAML ERROR] {layer_name} has invalid ratio {ratio}")
+
+        validated[layer_name] = r
+
+    # 6) Return validated dict
+    return validated
 
 
 def unstructured_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
@@ -231,13 +232,15 @@ def filter_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
         ValueError: If `sparsity` is negative.
     """
 
-    # 1) Basic validation
+    # 1) Validate sparsity
     if sparsity < 0.0:
         raise ValueError("sparsity must be >= 0.0")
 
-    # 2) Edge cases
+    # 2) Edge case: no pruning
     if sparsity == 0.0:
         return torch.ones_like(tensor, dtype=tensor.dtype)
+
+    # 3) Edge case: full pruning (sparsity >= 1.0)
     if sparsity >= 1.0:
         return torch.zeros_like(tensor, dtype=tensor.dtype)
 
@@ -307,6 +310,8 @@ def apply_pruning(model: nn.Module, prune_ratio_dict: dict, sparsity_type: str) 
     with torch.no_grad():
         # 1) Walk every parameter in the model
         for name, p in model.named_parameters():
+
+            # 1.1) only layers in YAML to be pruned
             if name not in prune_ratio_dict:
                 continue
 
@@ -314,9 +319,13 @@ def apply_pruning(model: nn.Module, prune_ratio_dict: dict, sparsity_type: str) 
             if p.dim() != 4:
                 continue
 
+            # 1.3) Do not prune first layer
+            if name == "features.0.weight":  # do not prune first conv
+                continue
+
             ratio = float(prune_ratio_dict[name])
 
-            # 3) Build pruning mask according to selected sparsity type
+            # 1.4) Build pruning mask according to selected sparsity type
             if sparsity_type == "unstructured":
                 mask = unstructured_prune(p.data, ratio)
             elif sparsity_type == "filter":
@@ -355,7 +364,7 @@ def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -
     total_empty = 0       # for filter
     total_filters = 0
 
-    print(f"Sparsity type is: {sparsity_type}")
+    print("Sparsity type is: {}".format(sparsity_type))
 
     # 3) Iterate through all parameters
     for name, p in model.named_parameters():
@@ -367,24 +376,40 @@ def test_sparsity(model: torch.nn.Module, sparsity_type: str = "unstructured") -
             params = w.numel()
             total_zeros += zeros
             total_params += params
-            print(f"(zero/total) weights of {name} is: ({zeros}/{params}). Sparsity is: {zeros/params:.4f}")
+            layer_sparse_pct = (zeros / params * 100.0) if params > 0 else 0.0
+            print("(zero/total) weights of {} is: ({}/{}){}. Sparsity is: {:.2f}%".format(
+                name, zeros, params, "" if params > 0 else "", layer_sparse_pct
+            ))
         else:
             # 3.2) Filter pruning only makes sense for conv weights: [OC, IC, kH, kW]
+            if w.dim() != 4:
+                continue
             oc = w.size(0)
             flat = w.view(oc, -1).abs().sum(dim=1)
             empty = (flat == 0).sum().item()
             total_empty += empty
             total_filters += oc
-            print(f"(empty/total) filter of {name} is: ({empty}/{oc}). filter sparsity is: {empty / oc:.4f}")
+            layer_sparse_pct = (empty / oc * 100.0) if oc > 0 else 0.0
+            print("(empty/total) filter of {} is: ({}/{}). filter sparsity is: {:.2f}%".format(
+                name, empty, oc, layer_sparse_pct
+            ))
 
     # 4) Print global stats
     print("-" * 75)
     if sparsity_type == "unstructured":
-        overall = total_zeros / total_params if total_params else 0.0
-        print(f"total number of zeros: {total_zeros}, non-zeros: {total_params - total_zeros}, overall sparsity is: {overall:.4f}")
+        overall = (total_zeros / total_params) if total_params > 0 else 0.0
+        print("total number of zeros: {}, non-zeros: {}, overall sparsity is: {:.4f}".format(
+            total_zeros,
+            total_params - total_zeros,
+            overall,
+        ))
     else:
-        overall = total_empty / total_filters if total_filters else 0.0
-        print(f"total number of filters: {total_filters}, empty-filters: {total_empty}, overall filter sparsity is: {overall:.4f}")
+        overall = (total_empty / total_filters) if total_filters > 0 else 0.0
+        print("total number of filters: {}, empty-filters: {}, overall filter sparsity is: {:.4f}".format(
+            total_filters,
+            total_empty,
+            overall,
+        ))
 
 
 def masked_retrain(
@@ -456,24 +481,156 @@ def masked_retrain(
             # Remove this line later
             train_loader.set_postfix(loss=loss.item())
 
-def oneshot_magnitude_prune(model, sparity_type, prune_ratio_dict):
-    # Implement the function that conducting oneshot magnitude pruning
-    # Target sparsity ratio dict should contains the sparsity ratio of each layer
-    # the per-layer sparsity ratio should be read from a external .yaml file
-    # This function should also include the masked_retrain() function to conduct fine-tuning to restore the accuracy
-    pass
 
-def iterative_magnitude_prune():
-    # Implement the function that conducting iterative magnitude pruning
-    # Target sparsity ratio dict should contains the sparsity ratio of each layer
-    # the per-layer sparsity ratio should be read from a external .yaml file
-    # You can choose the way to gradually increase the pruning ratio.
-    # For example, if the overall target sparsity is 80%, 
-    # you can achieve it by 20%->40%->60%->80% or 50%->60%->70%->80% or something else e.g., in LTH paper.
-    # At each sparsity level, you need to retrain your model. 
-    # Therefore, this IMP method requires more overall training epochs than OMP.
-    # ** IMP method needs to use at least 3 iterations.
-    pass
+def oneshot_magnitude_prune(
+    *,
+    model: nn.Module,
+    device: torch.device,
+    train_loader,
+    test_loader,
+    sparsity_type: str,
+    prune_ratio_dict: dict,
+    base_epochs: int = 15,
+):
+    """One-shot pruning + masked finetuning + eval.
+
+    Steps:
+    1) Apply pruning once from YAML-defined ratios.
+    2) Finetune while reapplying masks so pruned weights stay zero.
+    3) Evaluate final accuracy.
+
+    Args:
+        model (nn.Module): Model to prune and retrain.
+        device (torch.device): Device to run training/eval on.
+        train_loader (DataLoader): Training data for masked retrain.
+        test_loader (DataLoader): Test/val data for final eval.
+        sparsity_type (str): "unstructured" or "filter".
+        prune_ratio_dict (dict): param_name -> sparsity ratio.
+        base_epochs (int): Finetune epochs after pruning.
+
+    Returns:
+        Tuple[nn.Module, dict, float]: (pruned+retrained model, masks, test_acc)
+    """
+
+    # 1) Prune once using YAML ratios; make sure apply_pruning returns masks: name -> mask tensor
+    masks = apply_pruning(model, prune_ratio_dict, sparsity_type)
+    test_sparsity(model, sparsity_type)
+
+    # 2) Masked retrain with small LR + cosine
+    optimizer = torch.optim.SGD(model.parameters(),lr=0.01,momentum=0.9,weight_decay=1e-4,)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * base_epochs, eta_min=4e-8)
+    criterion = nn.CrossEntropyLoss()
+
+    # 3) Retrain
+    masked_retrain(
+        model=model,
+        masks=masks,
+        train_loader=train_loader,
+        device=device,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        criterion=criterion,
+        epochs=base_epochs,
+    )
+
+    # 3) Final accuracy
+    acc = test(model, device, test_loader)
+    return model, masks, acc
+
+
+def iterative_magnitude_prune(
+    *,
+    model: nn.Module,
+    device: torch.device,
+    train_loader,
+    test_loader,
+    sparsity_type: str,
+    prune_ratio_dict: dict,
+    base_epochs: int = 15,
+) -> tuple[nn.Module, dict, float]:
+    """Iterative Magnitude Pruning (IMP) with masked finetuning at each stage.
+
+    We do pruning in T (4 in this case) stages.
+
+    Args:
+        model (nn.Module): Model to prune iteratively.
+        device (torch.device): Device for training/eval.
+        train_loader (DataLoader): Data for masked finetuning after each step.
+        test_loader (DataLoader): Data for final eval.
+        sparsity_type (str): "unstructured" or "filter".
+        prune_ratio_dict (dict): param_name -> final target sparsity (0..1).
+        base_epochs (int): Finetune epochs per round.
+
+    Returns:
+        Tuple[nn.Module, float]: Final pruned model and test accuracy.
+    """
+
+    # 1) Decide stages of iteration based on sparsity type
+    if sparsity_type == "unstructured":
+        stage_targets = [0.40, 0.55, 0.70, 0.80]
+        final_target = 0.80
+    elif sparsity_type == "filter":
+        stage_targets = [0.20, 0.28, 0.35, 0.40]
+        final_target = 0.40
+    else:
+        raise ValueError(f"unsupported sparsity_type={sparsity_type}")
+
+    # 2) Iter through stages
+    acc_history = []
+    last_masks: dict[str, torch.Tensor] = {}
+    per_stage_epoch = base_epochs
+    for stage_idx, stage_target in enumerate(stage_targets, start=1):
+        # 1.1) build stage-specific ratios
+        stage_prune_dict = {}
+        scale = stage_target / final_target
+        for name, yaml_ratio in prune_ratio_dict.items():
+            r = float(yaml_ratio) * scale
+            if r < 0.0:
+                r = 0.0
+            if r > 1.0:
+                r = 1.0
+            stage_prune_dict[name] = r
+
+
+        # 1.2) apply pruning for this stage
+        masks = apply_pruning(model, stage_prune_dict, sparsity_type)
+        test_sparsity(model, sparsity_type)
+
+        # 1.3) Stage wise lr + epoch
+        if stage_idx <= 2:
+            lr = 0.02
+            per_stage_epoch -= int(0.2 * per_stage_epoch)
+        else:
+            lr = 0.01
+            per_stage_epoch += int(0.2 * per_stage_epoch)
+
+        # 1.4) Masked retrain with small LR + cosine
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4,)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * per_stage_epoch, eta_min=4e-8,)
+        criterion = nn.CrossEntropyLoss()
+
+        # 1.5) Retrain
+        masked_retrain(
+            model=model,
+            masks=masks,
+            train_loader=train_loader,
+            device=device,
+            optimizer=optimizer,
+            criterion=criterion,
+            scheduler=scheduler,
+            epochs=per_stage_epoch,
+        )
+        print(f"Stage {stage_idx}/{len(stage_targets)}") # remove later
+
+        # 1.6) Evaluate
+        acc = test(model, device, test_loader)
+        acc_history.append(acc)
+        last_masks = masks
+
+    # 2) Final accuracy
+    acc = test(model, device, test_loader)
+    return model, last_masks, acc
+
 
 def prune_channels_after_filter_prune():
     # 
@@ -529,44 +686,38 @@ def main():
     # 3) Data loaders
     train_loader, test_loader = get_dataloaders(args)
 
-    # 4) CE Loss Function + Optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
-    
-    # 5) lr scheduler to fine-tune/mask-retrain your pruned model.
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader), eta_min=4e-08)
-
-    # 6) Read prune ratio from yaml
+    # 4) Read prune ratio from yaml
     prune_dict = read_prune_ratios_from_yaml(args.yaml_path, model)
 
-    # 7) Apply Masking
-    masks = apply_pruning(model, prune_dict, args.sparsity_type)
+    # 5) Run OMP or IMP
+    if args.sparsity_method == "omp":
+        model, masks, acc = oneshot_magnitude_prune(
+            model=model,
+            device=device,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            sparsity_type=args.sparsity_type,
+            prune_ratio_dict=prune_dict,
+            base_epochs=15,
+        )
+    elif args.sparsity_method == "imp":
+        model, masks, acc = iterative_magnitude_prune(
+            model=model,
+            device=device,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            sparsity_type=args.sparsity_type,
+            prune_ratio_dict=prune_dict,
+            base_epochs=15,
+        )
+    else:
+        raise ValueError(f"unrecognized sparsity method: {args.sparsity_method}")
 
-    # 8) Test Sparsity with mask
-    test_sparsity(model, args.sparsity_type)
-
-    # 9) Retrain with mask
-    masked_retrain(model=model, masks=masks, train_loader=train_loader, device=device, optimizer=optimizer, criterion=criterion, scheduler=scheduler, epochs=args.epochs)
-
-    # 10) Sanity check to make sure model is still sparse and mask is working
-    test_sparsity(model, args.sparsity_type)
-
-    """
-        main()
-            |- read_prune_ratios_from_yaml()
-            |- IMP() or OMP()
-                |-apply_pruning()
-                    |-unstructured_prune()
-                    |-filter_prune()
-                |-masked_retrain()
-    """
-
-    # ---- you can test your model accuracy and sparity using the following fuction ---------
-    # test_sparsity()
-    # test(model, device, test_loader)
-
-    # ========================================
-    
+    # 8) Save model
+    target = "0.80" if args.sparsity_type == "unstructured" else "0.40"
+    fname = f"{args.sparsity_method}_{args.sparsity_type}_{target}_acc_{acc:.3f}.pt"
+    torch.save(model.state_dict(), fname)
+    print(f"[INFO] saved {fname}")
 
 
 if __name__ == '__main__':
